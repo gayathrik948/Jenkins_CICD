@@ -1,0 +1,189 @@
+pipeline {
+    agent any
+    environment
+    {
+        SERVICENAME = "10.10.38.17"
+        IMAGENAME = "auto_analytics"
+        PROJECTNAME = "ds_images"
+        TAG = "${BUILD_ID}"
+        REPOSITORYTAG = "${SERVICENAME}/${PROJECTNAME}/${IMAGENAME}:${TAG}"
+        HARBOR_CREDENTIAL = credentials('harbor_credentials')
+        DEPLOYMENTFILE = "deployment-auto-analytics.yaml"
+        DOCKERFILE_PATH = "cicd/Dockerfile-dev"
+        KUBECONFIG = credentials('k8s') // Assume kubeconfig is stored as a Jenkins secret
+        APP_LABEL = 'app-type=pod-ds-image' // Label selector for your application pods
+        NAMESPACE = 'ns-accounts-payable' // Namespace where your application is deployed
+    }
+    stages{
+        stage('pre-deployment check') {
+            steps {
+                sshagent(['k8s']) {
+                    script {
+                        try {
+                            // Get the current pods status for the specific application
+                            sh "ssh root@10.10.38.22 -p 8288 kubectl get pods -l ${APP_LABEL} -n ${NAMESPACE}"
+                        } catch (Exception e) {
+                            echo 'Pod not found, proceeding...'
+                        }
+                        try {
+                            // Get the logs of the current pods for the specific application
+                            def pods = sh(script: "ssh root@10.10.38.22 -p 8288 kubectl get pods -l ${APP_LABEL} -n ${NAMESPACE} -o jsonpath='{.items[*].metadata.name}'", returnStdout: true).trim().split()
+                            for (pod in pods) {
+                                echo "Logs for pod ${pod}:"
+                                sh "ssh root@10.10.38.22 -p 8288 kubectl logs ${pod} -n ${NAMESPACE}"
+                            }
+                        } catch (Exception e) {
+                            echo 'Logs not found, proceeding...'
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('SonarQube analysis') {
+            steps {
+                script {
+                    def scannerHome = tool name: 'SonarQube Scanner 4.8', type: 'hudson.plugins.sonar.SonarRunnerInstallation'
+                    withSonarQubeEnv('SonarQubeServer') {
+                        // Add the quality profile option to the scanner command
+                        def scannerCommand = "${scannerHome}/bin/sonar-scanner " +
+                        "-Dsonar.projectKey=Accounts_Payable_auto_analytics_3fa1e347-5fa7-46f3-853e-9babac7c726f " +
+                        "-Dsonar.sources=${WORKSPACE} " +
+                        "-Dsonar.profile=ds_profile " +
+                        "-Dsonar.exclusions=others/datamodel.py,others/scaffold.py,others/manager.py,others/goal.py,others/executor.py,others/persona.py,others/summarizer.py"
+
+                        sh scannerCommand
+                    }
+                }
+            }
+        }
+
+        /*stage('Quality Gate') {
+            steps {
+                script {
+                    def qg = waitForQualityGate() // This function waits for SonarQube analysis and returns quality gate status
+                    def qualityGateStatus = qg.status // Obtain the quality gate status
+                    if (qualityGateStatus == 'OK') {
+                        echo 'Quality gate passed. Continuing with pipeline.'
+                    } else {
+                        echo 'Quality gate failed. Halting pipeline.'
+                        currentBuild.result = 'FAILURE'
+                        error('Quality gate failed. Halting pipeline.')
+                    }
+                }
+            }
+        }*/
+
+        stage('git') {
+            steps {
+                sh "sed 's|imagesacregistry.azurecr.io/${IMAGENAME}|$REPOSITORYTAG|g' kubernetes/deployment-private-dev.yaml > ${DEPLOYMENTFILE}"
+                checkout scmGit(branches: [[name: '*/dev']], extensions: [], userRemoteConfigs: [[credentialsId: 'DevopsSSSH', url: 'git@ssh.dev.azure.com:v3/hobasa/Accounts%20Payable/auto_analytics']])
+            }
+
+        }
+        stage('docker') {
+            steps {
+                script
+                {
+                    sh 'docker build -t ${REPOSITORYTAG} --file ${DOCKERFILE_PATH} .'
+                }
+            }
+        }
+        stage('docker login') {
+            steps {
+                // replace the Docker Hub username behind -u and do not forget ''. You can also use a Docker Hub token.
+                sh '''echo $HARBOR_CREDENTIAL_PSW | docker login $SERVICENAME -u 'thirupathi' --password-stdin'''
+            }
+        }
+        stage('Harbor') {
+            steps {
+                sh 'docker push ${REPOSITORYTAG}'
+                //sh 'docker rmi -f ${IMAGE_NAME}:${BUILD_ID}'
+                sh 'docker rmi -f ${REPOSITORYTAG}'
+
+            }
+        }
+        stage('Deploying App to Kubernetes') {
+            steps {
+                sshagent(['k8s']) {
+                    sh 'scp -P 8288 -o StrictHostKeyChecking=no ${DEPLOYMENTFILE} root@10.10.38.22:/root/ds-image'
+                    script {
+                        try
+                        {
+                            sh 'ssh root@10.10.38.22 -p 8288 kubectl apply -f /root/ds-image/${DEPLOYMENT_FILE}'
+                        } catch(error) {
+                            sh 'ssh root@10.10.38.22 -p 8288 kubectl create -f /root/ds-image/${DEPLOYMENT_FILE}'
+                        }
+                    }
+                }
+            }
+        }
+        stage('post-deployment check') {
+            steps {
+                sshagent(['k8s']) {
+                    script {
+                        sleep(time: 1, unit: 'MINUTES')
+                        try {
+                            // Get the current pods status for the specific application
+                            sh "ssh root@10.10.38.22 -p 8288 kubectl get pods -l ${APP_LABEL} -n ${NAMESPACE}"
+                        } catch (Exception e) {
+                            echo 'Pod not found, proceeding...'
+                        }
+                        sleep(time: 1, unit: 'MINUTES')
+                        // Get the logs of the current pods for the specific application
+                        def pods = sh(script: "ssh root@10.10.38.22 -p 8288 kubectl get pods -l ${APP_LABEL} -n ${NAMESPACE} -o jsonpath='{.items[*].metadata.name}'", returnStdout: true).trim().split()
+                        for (pod in pods) {
+                            echo "Logs for pod ${pod}:"
+                            sh "ssh root@10.10.38.22 -p 8288 kubectl logs ${pod} -n ${NAMESPACE}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+    post {
+        always {
+            script {
+                def pipelineName = currentBuild.fullDisplayName
+                def buildId = currentBuild.id
+
+                // Define the time zone as IST (Indian Standard Time)
+                TimeZone istTimeZone = TimeZone.getTimeZone("Asia/Kolkata")
+
+                // Get the current date and time in the IST time zone
+                Calendar istCalendar = Calendar.getInstance(istTimeZone)
+                def istFormattedDateTime = istCalendar.format("yyyy-MM-dd HH:mm:ss")
+
+                def pipelineStatus = currentBuild.result ?: 'SUCCESS'
+                def jenkinsBuildUrl = env.BUILD_URL
+
+                // Define a list of email addresses
+                def toEmails = ['thirupathic@hobasa.com', 'tarunm@hobasa.com', 'gayathrik@hobasa.com', 'santoshy@hobasa.com', 'gauravk@hobasa.com']
+
+                // Construct the email body with an explicit status message
+                def statusMessage = pipelineStatus == 'SUCCESS' ? 'succeeded' : 'failed'
+
+                def emailBody = """
+                Hi Team,
+
+                The Jenkins pipeline '$pipelineName' with Build ID: $buildId was triggered on $istFormattedDateTime IST.
+
+                The pipeline has $statusMessage.
+
+                To view the details of the pipeline, click on the following URL:
+                $jenkinsBuildUrl
+
+                For more information, please refer to the Jenkins dashboard.
+
+                Best regards,
+                Your Jenkins Server
+                """
+
+                emailext subject: "Pipeline $statusMessage: $pipelineName (Build ID: $buildId)",
+                body: emailBody,
+                to: toEmails.join(', '), // Join the email addresses with a comma and space
+                mimeType: 'text/plain'
+            }
+        }
+    }
+}
