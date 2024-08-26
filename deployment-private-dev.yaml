@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ds-image
+  namespace: ns-accounts-payable
+  labels:
+    app-type: dep-ds-image
+spec:
+  selector:
+    matchLabels:
+      app-type: pod-ds-image
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app-type: pod-ds-image
+    spec:
+      containers:
+        - name: ds-image
+          image: imagesacregistry.azurecr.io/auto_analytics
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            seccompProfile:
+              type: RuntimeDefault
+          ports:
+            - containerPort: 5000
+          envFrom:
+            - configMapRef:
+                name: ds-image-config
+          resources:
+            requests:
+              memory: "600Mi"
+              cpu: "50m"
+            limits:
+              memory: "1Gi"
+              cpu: "100m"
+      restartPolicy: Always
+      automountServiceAccountToken: false
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ds-image-config
+  namespace: ns-accounts-payable
+data:
+  PROFILE: private-dev
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: srv-ds-image
+  namespace: ns-accounts-payable
+spec:
+  ports:
+  - port: 5000
+  selector:
+    app-type: pod-ds-image
